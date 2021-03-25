@@ -330,7 +330,8 @@ def estimate_h2(args, log):
                     evenodd_split=args.evenodd_split,
                     nn=args.nn,
                     keep_large=args.keep_large,
-                    nnls_exact=args.nnls_exact
+                    nnls_exact=args.nnls_exact,
+                    enet = True
                     )
 
     if args.print_cov:

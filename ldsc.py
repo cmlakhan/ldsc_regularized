@@ -619,6 +619,9 @@ parser.add_argument('--ridge-jackknife', default=False, action='store_true',
     help='If turned on, will perform jackknife when ridge is turned on (i.e., when using --loco)')
 
 
+parser.add_argument('--enet', default=False, action='store_true',
+    help='If turned on, will perform elastic net regression (i.e., when using --loco)')
+
 
 
 if __name__ == '__main__':

@@ -18,6 +18,12 @@ from scipy.optimize import nnls
 np.seterr(divide='raise', invalid='raise')
 from tqdm import tqdm
 from sklearn.linear_model import Lasso
+from sklearn.model_selection import LeaveOneGroupOut
+from sklearn.model_selection import GridSearchCV
+from sklearn.linear_model import ElasticNet
+from sklearn.linear_model import ElasticNetCV
+from sklearn.model_selection import GridSearchCV
+from sklearn.metrics import r2_score
 import logging
 import warnings
 warnings.filterwarnings('ignore', message='Coordinate descent with alpha=0 may lead to unexpected results and is discouraged.')
@@ -827,4 +833,225 @@ class Jackknife_Ridge(Jackknife):
         return np.linalg.solve(XTX+I, XTy)
 
 
+class Jackknife_enet(Jackknife):
 
+    def __init__(self, x, y, n_blocks=None, separators=None, chr_num=None, verbose=True,
+                 num_lambdas=100, approx_ridge=False,
+                 ridge_lambda=None, use_1se=False, has_intercept=False, standardize=True,
+                 skip_ridge_jackknife=True, num_chr_sets=2):
+
+        # sanity checks
+        assert chr_num is not None
+        # # # chr_num[:100000]=1
+        # # # chr_num[100000:]=2
+        assert len(np.unique(chr_num)) > 1
+
+        # init stuff
+        Jackknife.__init__(self, x, y, n_blocks=n_blocks, separators=separators)
+        self.use_1se = use_1se
+        self.verbose = verbose
+        self.has_intercept = has_intercept
+
+        ###define chromosome sets
+        assert num_chr_sets > 1
+
+        if num_chr_sets == 2:
+            # Use the good old fashioned odd/even chromosome split
+            chromosomes = np.sort(np.unique(chr_num))
+            self.chromosome_sets = []
+            self.chromosome_sets.append(chromosomes[chromosomes % 2 == 0])
+            self.chromosome_sets.append(chromosomes[chromosomes % 2 != 0])
+        elif num_chr_sets == 22:
+            self.chromosome_sets = [np.array([c]) for c in range(1, 23)]
+        else:
+            chr_sizes = np.bincount(chr_num)[1:]
+            assert num_chr_sets <= len(chr_sizes)
+            chr_assignments = self._divide_chromosomes_to_sets(chr_sizes, num_chr_sets)
+            self.chromosome_sets = []
+            for set_i in range(num_chr_sets):
+                self.chromosome_sets.append(np.where(chr_assignments == set_i)[0] + 1)
+
+        # make sure we work with numpy arrays, not dataframes
+        try:
+            x = x.values
+        except:
+            pass
+        try:
+            y = y.values
+        except:
+            pass
+        try:
+            constraints = constraints.values
+        except:
+            pass
+        try:
+            chr_num = chr_num.values
+        except:
+            pass
+
+        # make y look like a vector
+        assert y.shape[1] == 1
+        y = y[:, 0]
+
+        # standardize x
+        if standardize:
+            x_l2 = np.sqrt(np.einsum('ij,ij->j', x, x))
+            x /= x_l2
+        else:
+            x_l2 = None
+
+        # Create a set of ridge lambdas to evaluate
+        XTX_all = x.T.dot(x)
+        XTy_all = y.dot(x)
+        mean_diag = np.mean(np.diag(XTX_all))
+        self.ridge_lambdas = np.logspace(np.log10(mean_diag * 1e-8), np.log10(mean_diag * 1e2), num=num_lambdas)
+
+        # find best lambda (using off-chromosome estimation) and estimate taus
+        if ridge_lambda is not None:
+            assert self.approx_ridge
+            best_lambda = ridge_lambda
+        else:
+            best_lambda, r2_best_lambda = self._find_best_lambda(x, y, XTX_all, XTy_all, chr_num)
+        self.est = np.atleast_2d(self._est_ridge(XTX_all, XTy_all, best_lambda))
+        self.r2_best_lambda = r2_best_lambda
+        if standardize:
+            self.est /= x_l2
+
+        # LOCO (leave one chromosome out) computations
+        self.est_chr_lstsq, self.est_chr_ridge, self.est_loco_lstsq, self.est_loco_ridge = \
+            self._est_taus_loco(x, y, XTX_all, XTy_all, chr_num, best_lambda, standardize, x_l2)
+
+        # run jackknife
+        if not skip_ridge_jackknife:
+            self.delete_values = np.empty((len(self.separators) - 1, self.est.shape[1]), dtype=np.float32)
+            self.est_chr_lstsq_jk_list = []
+            self.est_chr_ridge_jk_list = []
+            self.est_loco_lstsq_jk_list = []
+            self.est_loco_ridge_jk_list = []
+
+            logging.info('Running ridge jackknife...')
+            self.best_r2_jk_noblock = np.zeros(len(self.separators) - 1)
+            for block_i in tqdm(range(len(self.separators) - 1)):
+
+                # prepare data structures
+                x_block = x[self.separators[block_i]:self.separators[block_i + 1], ...]
+                y_block = y[self.separators[block_i]:self.separators[block_i + 1], ...]
+                XTX_noblock = XTX_all - x_block.T.dot(x_block)
+                XTy_noblock = XTy_all - y_block.dot(x_block)
+                slice_block = slice(self.separators[block_i], self.separators[block_i + 1])
+                x_noblock = np.delete(x, slice_block, axis=0)
+                y_noblock = np.delete(y, slice_block, axis=0)
+                chr_noblock = np.delete(chr_num, slice_block, axis=0)
+
+                # find best lambda for this jackknife block
+                if approx_ridge:
+                    best_lambda_noblock = best_lambda
+                else:
+                    best_lambda_noblock, r2_noblock = self._find_best_lambda(x_noblock, y_noblock, XTX_noblock,
+                                                                             XTy_noblock, chr_noblock)
+                self.best_r2_jk_noblock[block_i] = r2_noblock
+
+                # main jackknife estimation
+                est_block = self._est_ridge(XTX_noblock, XTy_noblock, best_lambda_noblock)
+                self.delete_values[block_i, ...] = est_block
+
+                # jackknife LOCO computation
+                est_chr_lstsq, est_chr_ridge, est_loco_lstsq, est_loco_ridge = \
+                    self._est_taus_loco(x_noblock, y_noblock, XTX_noblock, XTy_noblock,
+                                        chr_noblock, best_lambda_noblock, standardize, x_l2)
+                self.est_chr_lstsq_jk_list.append(est_chr_lstsq)
+                self.est_chr_ridge_jk_list.append(est_chr_ridge)
+                self.est_loco_lstsq_jk_list.append(est_loco_lstsq)
+                self.est_loco_ridge_jk_list.append(est_loco_ridge)
+            if standardize: self.delete_values /= x_l2
+
+            # compute jackknife pseudo-values
+            self.pseudovalues = self.delete_values_to_pseudovalues(self.delete_values, self.est)
+            (self.jknife_est, self.jknife_var, self.jknife_se, self.jknife_cov) = self.jknife(self.pseudovalues)
+
+        # restore original x
+        if standardize: x *= x_l2
+
+    def _divide_chromosomes_to_sets(self, chr_sizes, num_sets):
+        chr_order = np.argsort(chr_sizes)[::-1]  # np.arange(len(chr_sizes))
+        chr_assignments = np.zeros(22, dtype=np.int) - 1
+        chr_assignments[chr_order[:num_sets]] = np.arange(num_sets)
+        set_sizes = chr_sizes[chr_order[:num_sets]].copy()
+        for c_i in chr_order[num_sets: len(chr_sizes)]:
+            smallest_set = np.argmin(set_sizes)
+            chr_assignments[c_i] = smallest_set
+            set_sizes[smallest_set] += chr_sizes[c_i]
+        assert set_sizes.sum() == chr_sizes.sum()
+        return chr_assignments
+
+    def _est_taus_loco(self, x, y, XTX, XTy, chr_num, ridge_lambda, standardize, x_l2=None, reestimate_lambda=False):
+        chromosomes = np.sort(np.unique(chr_num))
+        est_set_lstsq = np.empty((len(self.chromosome_sets), x.shape[1]), dtype=np.float32)
+        est_noset_lstsq = np.empty((len(self.chromosome_sets), x.shape[1]), dtype=np.float32)
+        est_set_ridge = np.empty((len(self.chromosome_sets), x.shape[1]), dtype=np.float32)
+        est_noset_ridge = np.empty((len(self.chromosome_sets), x.shape[1]), dtype=np.float32)
+        tqdm_chr_sets = tqdm(self.chromosome_sets)
+        logging.info('Estimating annotation coefficients for each chromosomes set')
+        for set_i, chromosome_set in enumerate(tqdm_chr_sets):
+            is_in_set = np.isin(chr_num, chromosome_set)
+            if not np.any(is_in_set): continue
+            x_set = x[is_in_set]
+            y_set = y[is_in_set]
+            XTX_set = x_set.T.dot(x_set)
+            XTy_set = y_set.dot(x_set)
+            XTX_noset = XTX - XTX_set
+            XTy_noset = XTy - XTy_set
+
+            if (not reestimate_lambda) or (len(chromosomes) <= 2):
+                best_lambda_noset = ridge_lambda
+                best_lambda_set = ridge_lambda
+            else:
+                x_loco = x[~is_in_set]
+                y_loco = y[~is_in_set]
+                chr_loco = chr_num[~is_in_set]
+                best_lambda_noset, r2_noset = self._find_best_lambda(x_loco, y_loco, XTX_noset, XTy_noset, chr_loco)
+                if len(chromosome_set) == 1:
+                    best_lambda_set = ridge_lambda
+                else:
+                    best_lambda_set, r2_set = self._find_best_lambda(x_set, y_set, XTX_set, XTy_set, chr_num[is_in_set])
+            est_set_lstsq[set_i, :] = self._est_ridge(XTX_set, XTy_set, ridge_lambda=0)
+            est_set_ridge[set_i, :] = self._est_ridge(XTX_set, XTy_set, best_lambda_set)
+            est_noset_lstsq[set_i, :] = self._est_ridge(XTX_noset, XTy_noset, ridge_lambda=0)
+            est_noset_ridge[set_i, :] = self._est_ridge(XTX_noset, XTy_noset, best_lambda_noset)
+            ###import ipdb; ipdb.set_trace()
+
+        if standardize:
+            est_set_lstsq /= x_l2
+            est_set_ridge /= x_l2
+            est_noset_lstsq /= x_l2
+            est_noset_ridge /= x_l2
+
+        return est_set_lstsq, est_set_ridge, est_noset_lstsq, est_noset_ridge
+
+    def _find_best_lambda(self, x, y, XTX, XTy, chr_num):
+        chromosomes = np.sort(np.unique(chr_num))
+        assert len(chromosomes) > 1
+        num_lambdas = len(self.ridge_lambdas)
+        logo = LeaveOneGroupOut()
+        parameters = {'alpha': self.ridge_lambdas}
+        #clf = GridSearchCV(ElasticNet(l1_ratio=0.5),param_grid=parameters,
+        #                   scoring='r2', cv=logo.split(x,y,chr_num), verbose=2)
+        regr = ElasticNetCV(cv=logo.split(x,y,chr_num),l1_ratio=0.5, alphas=self.ridge_lambdas, verbose=2)
+        regr.fit(x, y)
+        best_lambda = regr.alpha_
+        best_score = regr.score(x,y)
+        return best_lambda, best_score
+
+
+
+    def _predict_lambdas(self, XTX_train, XTy_train, X_validation):
+        tau_est_ridge = np.empty((XTX_train.shape[0], len(self.ridge_lambdas)), dtype=np.float32)
+        for r_i, r in enumerate(self.ridge_lambdas):
+            tau_est_ridge[:, r_i] = self._est_ridge(XTX_train, XTy_train, r)
+        y_pred = X_validation.dot(tau_est_ridge)
+        return y_pred
+
+    def _est_ridge(self, XTX, XTy, ridge_lambda):
+        I = np.eye(XTX.shape[0]) * ridge_lambda
+        if self.has_intercept: I[-1, -1] = 0
+        return np.linalg.solve(XTX + I, XTy)
