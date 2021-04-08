@@ -23,6 +23,9 @@ from sklearn.model_selection import GridSearchCV
 from sklearn.linear_model import ElasticNet
 from sklearn.linear_model import ElasticNetCV
 from sklearn.model_selection import GridSearchCV
+from sklearn.linear_model import Ridge
+import pandas as pd
+
 from sklearn.metrics import r2_score
 import logging
 import warnings
@@ -634,6 +637,13 @@ class Jackknife_Ridge(Jackknife):
             x_l2 = None
         
         #Create a set of ridge lambdas to evaluate
+
+        #np.savez('/gpfs/commons/home/clakhani/data/ldsc_debugging/x_bmi.npz',x)
+        #np.savez('/gpfs/commons/home/clakhani/data/ldsc_debugging/y_bmi.npz',y)
+        #np.savez('/gpfs/commons/home/clakhani/data/ldsc_debugging/chr_num_bmi.npz', chr_num)
+
+
+
         XTX_all = x.T.dot(x)
         XTy_all = y.dot(x)
         mean_diag = np.mean(np.diag(XTX_all))
@@ -682,7 +692,7 @@ class Jackknife_Ridge(Jackknife):
                     best_lambda_noblock = best_lambda
                 else:
                     best_lambda_noblock, r2_noblock = self._find_best_lambda(x_noblock, y_noblock, XTX_noblock, XTy_noblock, chr_noblock)
-                self.best_r2_jk_noblock[block_i] = r2_noblock
+                    self.best_r2_jk_noblock[block_i] = r2_noblock
                 
                 #main jackknife estimation
                 est_block = self._est_ridge(XTX_noblock, XTy_noblock, best_lambda_noblock)            
@@ -697,9 +707,6 @@ class Jackknife_Ridge(Jackknife):
                 self.est_loco_lstsq_jk_list.append(est_loco_lstsq)
                 self.est_loco_ridge_jk_list.append(est_loco_ridge)
             if standardize: self.delete_values /= x_l2
-                
-                
-                
 
             #compute jackknife pseudo-values
             self.pseudovalues = self.delete_values_to_pseudovalues(self.delete_values, self.est)
@@ -904,7 +911,7 @@ class Jackknife_enet(Jackknife):
         XTX_all = x.T.dot(x)
         XTy_all = y.dot(x)
         mean_diag = np.mean(np.diag(XTX_all))
-        self.ridge_lambdas = np.logspace(np.log10(mean_diag * 1e-8), np.log10(mean_diag * 1e2), num=num_lambdas)
+        self.ridge_lambdas = np.logspace(np.log10(mean_diag * 1e-8), np.log10(mean_diag * 1e2), num=5)
 
         # find best lambda (using off-chromosome estimation) and estimate taus
         if ridge_lambda is not None:
@@ -1034,12 +1041,20 @@ class Jackknife_enet(Jackknife):
         num_lambdas = len(self.ridge_lambdas)
         logo = LeaveOneGroupOut()
         parameters = {'alpha': self.ridge_lambdas}
-        #clf = GridSearchCV(ElasticNet(l1_ratio=0.5),param_grid=parameters,
-        #                   scoring='r2', cv=logo.split(x,y,chr_num), verbose=2)
-        regr = ElasticNetCV(cv=logo.split(x,y,chr_num),l1_ratio=0.5, alphas=self.ridge_lambdas, verbose=2)
-        regr.fit(x, y)
-        best_lambda = regr.alpha_
-        best_score = regr.score(x,y)
+        #enet_model = ElasticNet(l1_ratio=0.25, fit_intercept=False)
+        enet_model = Ridge(fit_intercept=False)
+        clf = GridSearchCV(enet_model, param_grid=parameters,
+                           scoring='r2', cv=logo.split(x,y,chr_num), verbose=2)
+        #clf = GridSearchCV(enet_model,param_grid=parameters,
+        #                   scoring='r2', cv=5, verbose=2)
+
+        #regr = ElasticNetCV(cv=logo.split(x,y,chr_num),l1_ratio=0.5,fit_intercept=False, alphas=self.ridge_lambdas, verbose=1)
+        #regr.fit(x, y)
+        clf.fit(x, y)
+        #best_lambda = regr.alpha_
+        #best_score = regr.score(x,y)
+        best_lambda = clf.best_estimator_
+        best_score = clf.best_score_
         return best_lambda, best_score
 
 

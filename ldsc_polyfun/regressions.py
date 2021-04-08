@@ -252,7 +252,7 @@ class LD_Score_Regression(object):
                     if self.constrain_intercept:
                         xc = x
 
-                    self.jknife_ridge = jk.Jackknife_enet(xc, y, n_blocks,
+                    self.jknife_ridge = jk.Jackknife_Ridge(xc, y, n_blocks,
                                                            chr_num=chr_num, verbose=verbose, ridge_lambda=ridge_lambda,
                                                            has_intercept=(not self.constrain_intercept),
                                                            standardize=standardize_ridge, approx_ridge=approx_ridge,
@@ -278,25 +278,57 @@ class LD_Score_Regression(object):
             jknife = IRWLS(
                 x, yp, update_func, n_blocks, slow=slow, w=initial_w)
 
-        self.coef, self.coef_cov, self.coef_se = self._coef(jknife, Nbar)
-        self.cat, self.cat_cov, self.cat_se =\
-            self._cat(jknife, M, Nbar, self.coef, self.coef_cov)
+        if not skip_ridge_jackknife:
+            self.coef, self.coef_cov, self.coef_se_jknife = self._coef_jackknife(Nbar)
+        else:
+            self.coef, self.coef_cov, self.coef_se = self._coef(jknife, Nbar)
+
+        if not skip_ridge_jackknife:
+            self.cat, self.cat_cov, self.cat_se = \
+                self._cat_ridge(M, Nbar, self.coef, self.coef_cov)
+        else:
+            self.cat, self.cat_cov, self.cat_se =\
+                self._cat(jknife, M, Nbar, self.coef, self.coef_cov)
+
 
         self.tot, self.tot_cov, self.tot_se = self._tot(self.cat, self.cat_cov)
-        self.prop, self.prop_cov, self.prop_se =\
-            self._prop(jknife, M, Nbar, self.cat, self.tot)
+
+        if not skip_ridge_jackknife:
+            self.prop, self.prop_cov, self.prop_se =\
+                self._prop_ridge(M, Nbar, self.cat, self.tot)
+        else:
+            self.prop, self.prop_cov, self.prop_se =\
+                self._prop(jknife, M, Nbar, self.cat, self.tot)
 
         self.enrichment, self.M_prop = self._enrichment(
             M, M_tot, self.cat, self.tot)
-        if not self.constrain_intercept:
-            self.intercept, self.intercept_se = self._intercept(jknife)
 
-        self.jknife = jknife
-        self.tot_delete_values = self._delete_vals_tot(jknife, Nbar, M)
-        self.part_delete_values = self._delete_vals_part(jknife, Nbar, M)
+        if not skip_ridge_jackknife:
+            if not self.constrain_intercept:
+                self.intercept, self.intercept_se = self._intercept_ridge()
+        else:
+            if not self.constrain_intercept:
+                self.intercept, self.intercept_se = self._intercept(jknife)
+
+        if not skip_ridge_jackknife:
+            self.jknife = self.jknife_ridge
+        else:
+            self.jknife = jknife
+
+        if not skip_ridge_jackknife:
+            self.tot_delete_values = self._delete_vals_tot_ridge(Nbar, M)
+            self.part_delete_values = self._delete_vals_part_ridge(Nbar, M)
+        else:
+            self.tot_delete_values = self._delete_vals_tot(jknife, Nbar, M)
+            self.part_delete_values = self._delete_vals_part(jknife, Nbar, M)
+
         if not self.constrain_intercept:
-            self.intercept_delete_values = jknife.delete_values[
-                :, self.n_annot]
+            if not skip_ridge_jackknife:
+                self.intercept_delete_values = self.jknife_ridge.delete_values[
+                                               :, self.n_annot]
+            else:
+                self.intercept_delete_values = jknife.delete_values[
+                    :, self.n_annot]
 
         self.M = M
 
@@ -312,6 +344,16 @@ class LD_Score_Regression(object):
     def _update_func(self, x, ref_ld_tot, w_ld, N, M, Nbar, intercept=None, ii=None):
         raise NotImplementedError
 
+
+    def _delete_vals_tot_ridge(self, Nbar, M):
+        '''Get delete values for total h2 or gencov.'''
+        n_annot = self.n_annot
+        tot_delete_vals = self.jknife_ridge.delete_values[
+            :, 0:n_annot]  # shape (n_blocks, n_annot)
+        # shape (n_blocks, 1)
+        tot_delete_vals = np.dot(tot_delete_vals, M.T) / Nbar
+        return tot_delete_vals
+
     def _delete_vals_tot(self, jknife, Nbar, M):
         '''Get delete values for total h2 or gencov.'''
         n_annot = self.n_annot
@@ -321,10 +363,24 @@ class LD_Score_Regression(object):
         tot_delete_vals = np.dot(tot_delete_vals, M.T) / Nbar
         return tot_delete_vals
 
+
+    def _delete_vals_part_ridge(self, Nbar, M):
+        '''Get delete values for partitioned h2 or gencov.'''
+        n_annot = self.n_annot
+        return self.jknife_ridge.delete_values[:, 0:n_annot] / Nbar
+
     def _delete_vals_part(self, jknife, Nbar, M):
         '''Get delete values for partitioned h2 or gencov.'''
         n_annot = self.n_annot
         return jknife.delete_values[:, 0:n_annot] / Nbar
+
+    def _coef_jackknife(self, Nbar):
+        '''Get coefficient estimates + cov from the jackknife.'''
+        n_annot = self.n_annot
+        coef = self.jknife_ridge.est[0, 0:n_annot] / Nbar
+        coef_cov = self.jknife_ridge.jknife_cov[0:n_annot, 0:n_annot] / Nbar ** 2
+        coef_se = np.sqrt(np.diag(coef_cov))
+        return coef, coef_cov, coef_se
 
     def _coef(self, jknife, Nbar):
         '''Get coefficient estimates + cov from the jackknife.'''
@@ -333,6 +389,13 @@ class LD_Score_Regression(object):
         coef_cov = jknife.jknife_cov[0:n_annot, 0:n_annot] / Nbar ** 2
         coef_se = np.sqrt(np.diag(coef_cov))
         return coef, coef_cov, coef_se
+
+    def _cat_ridge(self, M, Nbar, coef, coef_cov):
+        '''Convert coefficients to per-category h2 or gencov.'''
+        cat = np.multiply(M, coef)
+        cat_cov = np.multiply(np.dot(M.T, M), coef_cov)
+        cat_se = np.sqrt(np.diag(cat_cov))
+        return cat, cat_cov, cat_se
 
     def _cat(self, jknife, M, Nbar, coef, coef_cov):
         '''Convert coefficients to per-category h2 or gencov.'''
@@ -347,6 +410,20 @@ class LD_Score_Regression(object):
         tot_cov = np.sum(cat_cov)
         tot_se = np.sqrt(tot_cov)
         return tot, tot_cov, tot_se
+
+    def _prop_ridge(self, M, Nbar, cat, tot):
+        '''Convert total h2 and per-category h2 to per-category proportion h2 or gencov.'''
+        n_annot = self.n_annot
+        n_blocks = self.jknife_ridge.delete_values.shape[0]
+        numer_delete_vals = np.multiply(
+            M, self.jknife_ridge.delete_values[:, 0:n_annot]) / Nbar  # (n_blocks, n_annot)
+        denom_delete_vals = np.sum(
+            numer_delete_vals, axis=1).reshape((n_blocks, 1))
+        denom_delete_vals = np.dot(denom_delete_vals, np.ones((1, n_annot)))
+        prop = jk.RatioJackknife(
+            cat / tot, numer_delete_vals, denom_delete_vals)
+        return prop.est, prop.jknife_cov, prop.jknife_se
+
 
     def _prop(self, jknife, M, Nbar, cat, tot):
         '''Convert total h2 and per-category h2 to per-category proportion h2 or gencov.'''
@@ -366,6 +443,13 @@ class LD_Score_Regression(object):
         M_prop = M / M_tot
         enrichment = np.divide(cat, M) / (tot / M_tot)
         return enrichment, M_prop
+
+    def _intercept_ridge(self):
+        '''Extract intercept and intercept SE from block jackknife.'''
+        n_annot = self.n_annot
+        intercept = self.jknife_ridge.est[0, n_annot]
+        intercept_se = self.jknife_ridge.jknife_se[0, n_annot]
+        return intercept, intercept_se
 
     def _intercept(self, jknife):
         '''Extract intercept and intercept SE from block jackknife.'''
