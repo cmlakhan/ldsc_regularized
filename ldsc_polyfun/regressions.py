@@ -279,7 +279,7 @@ class LD_Score_Regression(object):
                 x, yp, update_func, n_blocks, slow=slow, w=initial_w)
 
         if not skip_ridge_jackknife:
-            self.coef, self.coef_cov, self.coef_se_jknife = self._coef_jackknife(Nbar)
+            self.coef, self.coef_cov, self.coef_se = self._coef_ridge(Nbar)
         else:
             self.coef, self.coef_cov, self.coef_se = self._coef(jknife, Nbar)
 
@@ -374,7 +374,7 @@ class LD_Score_Regression(object):
         n_annot = self.n_annot
         return jknife.delete_values[:, 0:n_annot] / Nbar
 
-    def _coef_jackknife(self, Nbar):
+    def _coef_ridge(self, Nbar):
         '''Get coefficient estimates + cov from the jackknife.'''
         n_annot = self.n_annot
         coef = self.jknife_ridge.est[0, 0:n_annot] / Nbar
